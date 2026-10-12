@@ -1,16 +1,16 @@
-"""livetranslate.py — Mikrofon → Whisper → Konsole, in EINER Datei.
+"""livetranslate.py — Mikrofon → Whisper → Konsole, in EINER Datei, OHNE Threads.
 
-Prinzip (Queue-Architektur, 3 Threads):
-  - Recorder:     Mikrofon (16 kHz mono) füllt kontinuierlich einen Ring-
-                  speicher der Länge context_interval Sekunden.
-  - Committer:    Alle update_interval Sekunden wird der GESAMTE Ring-
-                  speicherinhalt (Anfang bis Ende!) in die Erkennungs-Queue
-                  geworfen.
-  - Whisper-Worker: Holt die Snapshots aus der Queue und transkribiert.
+Prinzip (minimal):
+  - Der Mikrofon-Callback akkumuliert update_interval lange Chunks und wirft
+    sie in eine Queue (der Soundkarten-Puffer überbrückt die Whisper-Zeit).
+  - Die Whisper-Schleife nimmt einen Chunk aus der Queue, hängt ihn ans
+    Ring-Array an und schneidet am Anfang so viel ab, dass die Gesamtlänge
+    genau context_interval beträgt. Dann transkribieren, print.
+  - Kein Lock, kein Worker-Thread, kein Committer — ein einziger
+    Python-Thread zwischen zwei Callbacks.
 
-Die Aufzeichnung läuft PARALLEL zur Erkennung — egal wie lange Whisper
-braucht, es geht kein Audio verloren (interleaved Betrieb). Ist Whisper
-dauerhaft zu langsam, verdrängt der neueste Snapshot die alten.
+Alle Intervalle werden vor dem Start in Sample-Anzahlen umgerechnet und
+angezeigt.
 
 Aufruf:
   .venv/bin/python livetranslate.py                      # Defaults
@@ -26,7 +26,6 @@ import argparse
 import ctypes
 import glob
 import queue
-import threading
 import time
 from pathlib import Path
 
@@ -51,9 +50,9 @@ def main() -> int:
     ap.add_argument("--model", default="medium",
                     help="Whisper-Modell (small/medium/large-v3)")
     ap.add_argument("--update", type=float, default=2.0,
-                    help="update_interval: Sekunden zwischen zwei Queue-Einwürfen")
+                    help="update_interval: Chunk-Länge für die Queue (Sekunden)")
     ap.add_argument("--context", type=float, default=10.0,
-                    help="context_interval: Ringpuffer-Länge in Sekunden")
+                    help="context_interval: Ring-Array-Länge (Sekunden)")
     ap.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
     ap.add_argument("--compute", default=None,
                     help="int8_float16 (GPU) | int8 (CPU) | float16 | float32")
@@ -61,93 +60,78 @@ def main() -> int:
 
     compute = args.compute or ("int8_float16" if args.device == "cuda" else "int8")
 
+    # ---------------------------------------------------------------- Intervalle
+    # VOR dem Start in Sample-Anzahlen umrechnen und anzeigen:
+    update_samples = int(round(args.update * SAMPLE_RATE))
+    context_samples = int(round(args.context * SAMPLE_RATE))
+    update_blocks = update_samples // 512          # Mikrofon-Blöcke à 512 Samples
+
     from faster_whisper import WhisperModel
     print(f"Lade Whisper {args.model} ({args.device}/{compute}) …")
     model = WhisperModel(args.model, device=args.device, compute_type=compute)
-    print(f"bereit. Alle {args.update:.1f}s werden die letzten {args.context:.1f}s "
-          f"in die Queue geworfen. (Strg+C beendet)\n")
+    print(
+        f"bereit.\n"
+        f"  update_interval : {args.update:.2f} s = {update_samples} Samples "
+        f"({update_blocks} Mikrofon-Blöcke à 512)\n"
+        f"  context_interval: {args.context:.2f} s = {context_samples} Samples\n"
+        f"  (Strg+C beendet)\n"
+    )
 
-    # ---------------------------------------------------------------- Zustand
-    max_samples = int(args.context * SAMPLE_RATE)
-    ring = np.zeros(0, dtype=np.float32)
-    ring_lock = threading.Lock()
-    mic_q: "queue.Queue[np.ndarray | None]" = queue.Queue(maxsize=400)
-    # Erkennungs-Queue (Größe 2): wenn Whisper dauerhaft zu langsam ist,
-    # gewinnt immer der NEUESTE Snapshot — alte sind ohnehin veraltet.
-    work_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=2)
+    # ---------------------------------------------------------------- Queue
+    # Der Callback sammelt update_interval lange Chunks und wirft sie hier ein.
+    chunk_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=8)
+
+    pending = []                 # Mikrofon-Blöcke bis zur Chunk-Größe
+    pending_samples = 0
+    dropped_chunks = 0
+    overflow_events = 0
 
     def callback(indata, frames, time_info, status):  # noqa: ANN001
-        try:
-            mic_q.put_nowait(indata[:, 0].copy())
-        except queue.Full:
-            pass                          # Frame verwerfen statt blockieren
+        nonlocal pending, pending_samples, dropped_chunks, overflow_events
+        if status:
+            overflow_events += 1
+        block = indata[:, 0].copy()
+        pending.append(block)
+        pending_samples += len(block)
+        # Chunk voll? → exakt update_samples heraustrennen, Rest behalten.
+        while pending_samples >= update_samples:
+            data = b"".join(b.tobytes() for b in pending)
+            chunk_all = np.frombuffer(data, dtype=np.float32)
+            head, tail = chunk_all[:update_samples], chunk_all[update_samples:]
+            pending = [tail.copy()] if len(tail) else []
+            pending_samples = len(tail)
+            try:
+                chunk_q.put_nowait(head.copy())
+            except queue.Full:
+                dropped_chunks += 1   # Whisper hängt → Chunk verwerfen (Zeitlücke)
 
     stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
                             blocksize=512, callback=callback)
     stream.start()
 
-    # ------------------------------------------------------ Thread 1: Recorder
-    stop_event = threading.Event()
-
-    def recorder() -> None:
-        nonlocal ring
-        while not stop_event.is_set():
-            try:
-                block = mic_q.get(timeout=0.2)
-            except queue.Empty:
-                continue
-            if block is None:
-                return
-            with ring_lock:
-                ring = np.concatenate([ring, block])
-                if len(ring) > max_samples:
-                    ring = ring[-max_samples:]   # Anfang abschneiden (Ring!)
-
-    threading.Thread(target=recorder, daemon=True).start()
-
-    # ------------------------------------------------------ Thread 2: Committer
-    # Alle update_interval Sekunden: Snapshot des GESAMTEN Ringspeichers in
-    # die work_q. Blockiert nie — ist die Queue voll (Whisper hängt hinterher),
-    # verdrängt der neueste Snapshot den ältesten.
-    def committer_loop() -> None:
-        next_commit = time.monotonic() + args.update
-        while not stop_event.is_set():
-            now = time.monotonic()
-            if now < next_commit:
-                time.sleep(min(0.05, next_commit - now))
-                continue
-            with ring_lock:
-                snapshot = ring.copy()
-            if len(snapshot) > SAMPLE_RATE // 2:
-                try:
-                    work_q.put_nowait(snapshot)
-                except queue.Full:
-                    try:
-                        work_q.get_nowait()      # ältesten verwerfen
-                    except queue.Empty:
-                        pass
-                    try:
-                        work_q.put_nowait(snapshot)
-                    except queue.Full:
-                        pass
-            next_commit += args.update
-            if next_commit < time.monotonic():
-                next_commit = time.monotonic()
-
-    threading.Thread(target=committer_loop, daemon=True).start()
-
-    # -------------------------------------------------- Thread 3: Whisper-Worker
+    # ---------------------------------------------------------------- Whisper-Loop
+    ring = np.zeros(0, dtype=np.float32)   # wächst bis context_samples, dann gekürzt
     run_number = 0
+    last_dropped = 0
+    last_overflow = 0
     try:
         while True:
             try:
-                snapshot = work_q.get(timeout=0.5)
+                chunk = chunk_q.get(timeout=0.5)
             except queue.Empty:
                 continue
+
+            # Chunk ans Ring-Array anhängen …
+            ring = np.concatenate([ring, chunk])
+            # … und am ANFANG so viel abschneiden, dass die Gesamtlänge
+            # exakt context_samples beträgt.
+            if len(ring) > context_samples:
+                ring = ring[-context_samples:]
+
             run_number += 1
             t0 = time.monotonic()
             segments, _info = model.transcribe(
-                np.ascontiguousarray(snapshot, dtype=np.float32),
+                np.ascontiguousarray(ring, dtype=np.float32),
                 language="de",
                 beam_size=5,
                 word_timestamps=False,
@@ -155,12 +139,21 @@ def main() -> int:
             )
             text = " ".join(s.text.strip() for s in segments).strip()
             dt = time.monotonic() - t0
+
+            warn = ""
+            if dropped_chunks > last_dropped:
+                warn += f" ⚠ {dropped_chunks - last_dropped} Chunks verworfen (Whisper zu langsam → Zeitlücke)"
+                last_dropped = dropped_chunks
+            if overflow_events > last_overflow:
+                warn += f" ⚠ {overflow_events - last_overflow} Overflows"
+                last_overflow = overflow_events
+
             print(f"[#{run_number:03d} {time.strftime('%H:%M:%S')}] "
-                  f"({dt:.1f}s) {text if text else '—'}", flush=True)
+                  f"({dt:.1f}s, {len(ring)/SAMPLE_RATE:.1f}s Kontext) "
+                  f"{text if text else '—'}{warn}", flush=True)
     except KeyboardInterrupt:
         print("\n— Ende —")
     finally:
-        stop_event.set()
         stream.stop()
         stream.close()
     return 0
