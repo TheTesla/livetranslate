@@ -43,6 +43,7 @@ import numpy as np  # noqa: E402
 import sounddevice as sd  # noqa: E402
 
 from text_stitch import TextStitcher  # noqa: E402
+from pyramid_stitch import PyramidStitcher  # noqa: E402
 
 SAMPLE_RATE = 16000
 
@@ -62,7 +63,10 @@ def main() -> int:
                     help="rohe Fenstertexte anzeigen statt gestitchtem Strom")
     ap.add_argument("--soft-tail", type=int, default=40,
                     help="letzte N Wörter des Stroms bleiben rückwirkend "
-                         "korrigierbar (0 = sofort einfrieren)")
+                         "korrigierbar (0 = sofort einfrieren; nur --stitch text)")
+    ap.add_argument("--stitch", choices=["pyramid", "text"], default="pyramid",
+                    help="pyramid: Zeitanker, emittierter Text unveränderlich "
+                         "(default) | text: iteratives Alignment mit weicher Zone")
     args = ap.parse_args()
 
     compute = args.compute or ("int8_float16" if args.device == "cuda" else "int8")
@@ -117,8 +121,13 @@ def main() -> int:
     stream.start()
 
     # ---------------------------------------------------------------- Whisper-Loop
-    stitcher = TextStitcher(soft_tail=args.soft_tail)
+    # Standard: PyramidStitcher (Zeitanker, emittierter Text ist unveränderlich).
+    # --stitch text: iterativer Stitcher (weiche Zone mit Rückwirkungskorrektur).
+    use_pyramid = args.stitch == "pyramid"
+    stitcher = (PyramidStitcher(context_s=args.context, update_s=args.update)
+                if use_pyramid else TextStitcher(soft_tail=args.soft_tail))
     ring = np.zeros(0, dtype=np.float32)   # wächst bis context_samples, dann gekürzt
+    stream_t0 = time.monotonic()           # absolute Audiozeit (für Slot-Zuordnung)
     run_number = 0
     last_dropped = 0
     last_overflow = 0
@@ -142,10 +151,11 @@ def main() -> int:
                 np.ascontiguousarray(ring, dtype=np.float32),
                 language="de",
                 beam_size=5,
-                word_timestamps=False,
+                word_timestamps=use_pyramid,   # Pyramid braucht Wortzeiten
                 condition_on_previous_text=False,
             )
-            text = " ".join(s.text.strip() for s in segments).strip()
+            segs = list(segments)
+            text = " ".join(s.text.strip() for s in segs).strip()
             dt = time.monotonic() - t0
 
             warn = ""
@@ -160,6 +170,19 @@ def main() -> int:
                 print(f"[#{run_number:03d} {time.strftime('%H:%M:%S')}] "
                       f"({dt:.1f}s, {len(ring)/SAMPLE_RATE:.1f}s Kontext) "
                       f"{text if text else '—'}{warn}", flush=True)
+            elif use_pyramid:
+                win_end = time.monotonic() - stream_t0
+                win_len = len(ring) / SAMPLE_RATE
+                words_ts = [(wd.word.strip(), wd.start, wd.end)
+                            for s in segs for wd in (s.words or [])]
+                emitted = stitcher.add_window(words_ts, win_end=win_end,
+                                              win_len=win_len)
+                print(f"[#{run_number:03d} {time.strftime('%H:%M:%S')}] "
+                      f"({dt:.1f}s) +{' '.join(emitted) if emitted else '—'}{warn}")
+                print(f"    STROM: {stitcher.committed_text}")
+                pend = stitcher.pending_text()
+                if pend:
+                    print(f"    pending: {pend}", flush=True)
             else:
                 confirmed = stitcher.add_chunk(text.split())
                 corr = " ".join(f"⇄{old}→{new}" for old, new in stitcher.last_corrections)
@@ -171,7 +194,10 @@ def main() -> int:
                 if pend:
                     print(f"    pending: {pend}", flush=True)
     except KeyboardInterrupt:
-        print("\n— Ende —")
+        if use_pyramid:
+            stitcher.flush()
+            print(f"\n    STROM (final): {stitcher.committed_text}")
+        print("— Ende —")
     finally:
         stream.stop()
         stream.close()

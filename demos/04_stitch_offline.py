@@ -1,14 +1,16 @@
 #!/usr/bin/env python
-"""demos/04_stitch_offline.py — Offline-Nachweis des Text-Stitchers.
+"""demos/04_stitch_offline.py — Offline-Nachweis der Stitcher.
 
 Erzeugt (einmalig) eine Referenz-Audio-Datei per espeak-ng, transkribiert
 sie (a) komplett als Referenz und (b) wie live: Fenster à context_interval
-Sekunden, alle update_interval Sekunden ein neues Fenster — genau wie in
-livetranslate.py. Die Fenster-Hypothesen gehen in den TextStitcher.
+Sekunden, alle update_interval Sekunden ein neues Fenster. Die Fenster-
+Hypothesen gehen in BEIDE Stitcher:
 
-Ausgabe: Stream-Entwicklung pro Tick + WER-Vergleich
-  - gestitchter kontinuierlicher Strom  vs.  Referenz (Voll-Audio)
-  - Baseline "nur letztes Fenster"      vs.  Referenz
+  - PyramidStitcher (Zeitanker, word_timestamps=True): Slots schließen sich,
+    sobald ihre Abdeckung vollständig ist; emittierter Text ist unveränderlich
+  - TextStitcher (text_stitch.py, iteratives Alignment gegen den Strom)
+
+Ausgabe: WER-Vergleich beider Verfahren + Baseline "nur letztes Fenster".
 
 Aufruf:
   .venv/bin/python demos/04_stitch_offline.py
@@ -41,6 +43,7 @@ import soxr  # noqa: E402
 from jiwer import wer  # noqa: E402
 
 from text_stitch import TextStitcher  # noqa: E402
+from pyramid_stitch import PyramidStitcher  # noqa: E402
 
 SAMPLE_RATE = 16000
 
@@ -67,19 +70,20 @@ def ensure_audio(path: Path) -> None:
     subprocess.run(["espeak-ng", "-v", "de", "-w", str(path), REF_TEXT], check=True)
 
 
-def transcribe(model, audio: np.ndarray) -> str:
+def transcribe(model, audio: np.ndarray, word_timestamps: bool = False):
     segments, _ = model.transcribe(audio, language="de", beam_size=5,
-                                   condition_on_previous_text=False)
-    return " ".join(s.text.strip() for s in segments).strip()
+                                   condition_on_previous_text=False,
+                                   word_timestamps=word_timestamps)
+    segs = list(segments)
+    text = " ".join(s.text.strip() for s in segs).strip()
+    return text, segs
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="large-v3-turbo")
-    ap.add_argument("--update", type=float, default=3.0,
-                    help="update_interval in Sekunden")
-    ap.add_argument("--context", type=float, default=24.0,
-                    help="context_interval in Sekunden")
+    ap.add_argument("--update", type=float, default=3.0)
+    ap.add_argument("--context", type=float, default=24.0)
     ap.add_argument("--device", default="cuda")
     args = ap.parse_args()
 
@@ -95,8 +99,7 @@ def main() -> int:
     dur = len(audio) / SAMPLE_RATE
     n_windows = int(np.ceil(dur / args.update))
     print(f"Audio: {dur:.1f}s → {n_windows} Fenster "
-          f"(update={args.update}s, context={args.context}s → "
-          f"~{int(args.context/args.update)} überlappende Fenster)\n")
+          f"(update={args.update}s, context={args.context}s)\n")
 
     from faster_whisper import WhisperModel
     print(f"Lade {args.model} ({args.device}) …")
@@ -104,47 +107,55 @@ def main() -> int:
                          compute_type="int8_float16" if args.device == "cuda" else "int8")
 
     print("Referenz: transkribiere GESAMTES Audio …")
-    t0 = time.monotonic()
-    ref_transcript = transcribe(model, audio)
-    print(f"Referenz in {time.monotonic()-t0:.1f}s: {ref_transcript}\n")
+    ref_transcript, _ = transcribe(model, audio)
+    print(f"Referenz: {ref_transcript}\n")
 
-    st = TextStitcher()
-    print("—" * 78)
+    old_st = TextStitcher()
+    py_st = PyramidStitcher(context_s=args.context, update_s=args.update)
     last_window_text = ""
+
+    print("—" * 78)
     for w in range(1, n_windows + 1):
         t_end = min(w * args.update, dur)
         t_start = max(0.0, t_end - args.context)
         window = audio[int(t_start * SAMPLE_RATE):int(t_end * SAMPLE_RATE)]
+        win_len = len(window) / SAMPLE_RATE
         t0 = time.monotonic()
-        text = transcribe(model, window)
+        text, segs = transcribe(model, window, word_timestamps=True)
         dt = time.monotonic() - t0
         last_window_text = text
-        confirmed = st.add_chunk(text.split())
-        corr = " ".join(f"⇄{o}→{n}" for o, n in st.last_corrections)
-        show = " ".join(st.committed[-14:])
-        pend = " ".join(st.pending[-6:])
-        print(f"Fenster {w:02d} ({t_start:4.1f}→{t_end:4.1f}s, {dt:4.1f}s) "
-              f"+{' '.join(confirmed) if confirmed else '—'}"
-              f"{'  ' + corr if corr else ''}")
-        print(f"    Stream: … {show}")
-        print(f"    pending: {pend}")
 
-    st.flush()
-    stitched = st.stream_text
+        old_st.add_chunk(text.split())
+        words_ts = [(wd.word.strip(), wd.start, wd.end)
+                    for s in segs for wd in (s.words or [])]
+        py_emitted = py_st.add_window(words_ts, win_end=t_end, win_len=win_len)
+
+        print(f"Fenster {w:02d} ({t_start:4.1f}→{t_end:4.1f}s, {dt:4.1f}s)"
+              f"  py+{' '.join(py_emitted) if py_emitted else '—'}")
+
+    old_st.flush()
+    py_st.flush()
+    stitched_old = old_st.stream_text
+    stitched_py = py_st.committed_text
 
     print("\n" + "=" * 78)
-    print("GESTITCHTER STROM:")
-    print(stitched)
+    print("PYRAMIDEN-STROM (Zeitanker):")
+    print(stitched_py)
+    print()
+    print("ITERATIVER STROM (text_stitch, zum Vergleich):")
+    print(stitched_old)
     print("=" * 78)
 
-    w_stitch = wer(ref_transcript, stitched)
+    w_py = wer(ref_transcript, stitched_py)
+    w_old = wer(ref_transcript, stitched_old)
     w_last = wer(ref_transcript, last_window_text)
     print(f"\nWER gegen Voll-Audio-Referenz:")
-    print(f"  gestitchter Strom : {w_stitch*100:5.1f} %")
-    print(f"  nur letztes Fenster (Baseline, deckt nur {args.context:.0f}s ab): "
-          f"{w_last*100:5.1f} %")
+    print(f"  Pyramiden-Stitcher  : {w_py*100:5.1f} %")
+    print(f"  iterativer Stitcher : {w_old*100:5.1f} %")
+    print(f"  nur letztes Fenster : {w_last*100:5.1f} %")
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
