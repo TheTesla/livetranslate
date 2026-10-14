@@ -42,6 +42,8 @@ for _lib in ("cublas", "cudnn"):
 import numpy as np  # noqa: E402
 import sounddevice as sd  # noqa: E402
 
+from text_stitch import TextStitcher  # noqa: E402
+
 SAMPLE_RATE = 16000
 
 
@@ -56,6 +58,11 @@ def main() -> int:
     ap.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
     ap.add_argument("--compute", default=None,
                     help="int8_float16 (GPU) | int8 (CPU) | float16 | float32")
+    ap.add_argument("--raw", action="store_true",
+                    help="rohe Fenstertexte anzeigen statt gestitchtem Strom")
+    ap.add_argument("--soft-tail", type=int, default=40,
+                    help="letzte N Wörter des Stroms bleiben rückwirkend "
+                         "korrigierbar (0 = sofort einfrieren)")
     args = ap.parse_args()
 
     compute = args.compute or ("int8_float16" if args.device == "cuda" else "int8")
@@ -110,6 +117,7 @@ def main() -> int:
     stream.start()
 
     # ---------------------------------------------------------------- Whisper-Loop
+    stitcher = TextStitcher(soft_tail=args.soft_tail)
     ring = np.zeros(0, dtype=np.float32)   # wächst bis context_samples, dann gekürzt
     run_number = 0
     last_dropped = 0
@@ -148,9 +156,20 @@ def main() -> int:
                 warn += f" ⚠ {overflow_events - last_overflow} Overflows"
                 last_overflow = overflow_events
 
-            print(f"[#{run_number:03d} {time.strftime('%H:%M:%S')}] "
-                  f"({dt:.1f}s, {len(ring)/SAMPLE_RATE:.1f}s Kontext) "
-                  f"{text if text else '—'}{warn}", flush=True)
+            if args.raw:
+                print(f"[#{run_number:03d} {time.strftime('%H:%M:%S')}] "
+                      f"({dt:.1f}s, {len(ring)/SAMPLE_RATE:.1f}s Kontext) "
+                      f"{text if text else '—'}{warn}", flush=True)
+            else:
+                confirmed = stitcher.add_chunk(text.split())
+                corr = " ".join(f"⇄{old}→{new}" for old, new in stitcher.last_corrections)
+                pend = " ".join(stitcher.pending)
+                print(f"[#{run_number:03d} {time.strftime('%H:%M:%S')}] "
+                      f"({dt:.1f}s) +{' '.join(confirmed) if confirmed else '—'}"
+                      f"{' ' + corr if corr else ''}{warn}")
+                print(f"    STROM: {stitcher.stream_text}")
+                if pend:
+                    print(f"    pending: {pend}", flush=True)
     except KeyboardInterrupt:
         print("\n— Ende —")
     finally:

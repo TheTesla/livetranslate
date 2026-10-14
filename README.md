@@ -2,6 +2,11 @@
 
 Echtzeit-Spracherkennung vom Mikrofon mit Whisper — komplett lokal, in einer Datei.
 
+**Neu:** `text_stitch.py` fügt die überlappenden Fenster-Transkripte zu einem
+kontinuierlichen, rückwirkend selbstkorrigierenden Textstrom zusammen
+(Needleman-Wunsch-Alignment + Fuzzy-Ähnlichkeit + ROVER-Mehrheitsvotum).
+Details und Entwicklungsgeschichte: [PROJECT_HISTORY.md](PROJECT_HISTORY.md).
+
 ## Prinzip
 
 Drei Threads, entkoppelt über zwei Puffer:
