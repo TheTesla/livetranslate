@@ -127,7 +127,7 @@ def main() -> int:
     stitcher = (PyramidStitcher(context_s=args.context, update_s=args.update)
                 if use_pyramid else TextStitcher(soft_tail=args.soft_tail))
     ring = np.zeros(0, dtype=np.float32)   # wächst bis context_samples, dann gekürzt
-    stream_t0 = time.monotonic()           # absolute Audiozeit (für Slot-Zuordnung)
+    audio_end = 0.0                        # absolute AUDIOzeit des Ring-Endes (nicht Wanduhr!)
     run_number = 0
     last_dropped = 0
     last_overflow = 0
@@ -144,6 +144,15 @@ def main() -> int:
             # exakt context_samples beträgt.
             if len(ring) > context_samples:
                 ring = ring[-context_samples:]
+            # win_end MUSS aus der Audiozeit abgeleitet werden (Chunk-Länge
+            # in Samples), nie aus der Wanduhr: Bei Stau läuft die Wanduhr
+            # dem Ring-Inhalt davon; schwankt der Rückstand, bekommt dasselbe
+            # Wort von verschiedenen Fenstern verschiedene Slot-Labels und
+            # wird von zwei Slots emittiert → doppelte Sätze (Repro:
+            # demos/06_backlog_repro.py). Es sei denn, Chunks wurden
+            # verworfen — dann springt die Audiozeit vor, was korrekt ist
+            # (die Zeitlücke ist real).
+            audio_end += len(chunk) / SAMPLE_RATE
 
             run_number += 1
             t0 = time.monotonic()
@@ -171,7 +180,7 @@ def main() -> int:
                       f"({dt:.1f}s, {len(ring)/SAMPLE_RATE:.1f}s Kontext) "
                       f"{text if text else '—'}{warn}", flush=True)
             elif use_pyramid:
-                win_end = time.monotonic() - stream_t0
+                win_end = audio_end
                 win_len = len(ring) / SAMPLE_RATE
                 words_ts = [(wd.word.strip(), wd.start, wd.end)
                             for s in segs for wd in (s.words or [])]
